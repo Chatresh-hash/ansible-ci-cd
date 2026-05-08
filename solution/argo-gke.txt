@@ -1,0 +1,301 @@
+Using ArgoCD in jenkins pipelines
+
+manual --> create gke cluster + install argocd on the cluster 
+
+Steps --> 
+
+all the steps are done on jenkins vm except step 8 and 9 (8 and 9 will be done on cloudshell manually)
+
+1. create a vm 
+2. install java and jenkins
+3. initailize jenkins via jenkins UI
+4. install docker on the vm
+5. give jenkins user permission to run docker commands 
+6. install maven
+7. install git 
+8. create a gke cluster 
+9. install argocd
+10. github url --> https://github.com/jsachdev07/tf-eks-ci-cd.git
+11. install kubectl on jenkins 
+12. install gcloud cli and google-cloud-sdk-gke-gcloud-auth-plugin on jenkins 
+13. install docker pipeline plugin and restart jenkins
+
+
+
+
+Adding credentials to jenkins --> 
+
+1. dockerhub credentials to push images to registry (dockerhub)
+
+2. github account credentials to push the updated yaml files on GH repo so that argocd can pick it up for deploy (github-creds)
+
+3. jenkins vm --> kubectl apply -f application.yaml 
+   - either we use GKE plugin 
+   - we use gcloud command to authenticate with GKE cluster from jenkins vm 
+   
+   for point 3 either you use plugin or you use gcloud command, how will you authenticate with GKE  ?? --> using private key of service account (gcp-service-account)
+
+
+
+============================================================================
+apt install wget curl git -y
+============================================================================
+sudo apt update
+sudo apt install fontconfig openjdk-21-jre -y
+java -version
+
+sudo wget -O /etc/apt/keyrings/jenkins-keyring.asc \
+  https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key
+
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc]" \
+  https://pkg.jenkins.io/debian-stable binary/ | sudo tee \
+  /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+sudo apt update
+sudo apt install jenkins -y
+============================================================================
+
+wget https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
+sudo mkdir -p /opt/maven
+sudo tar -xvzf apache-maven-3.9.9-bin.tar.gz -C /opt/maven/ --strip-components=1
+sudo ln -s /opt/maven/bin/mvn /usr/bin/mvn
+mvn --version 
+
+============================================================================
+sudo apt install docker.io -y
+chown root:jenkins /var/run/docker.sock
+
+============================================================================
+
+# Download kubectl 1.35
+curl -LO "https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl"
+
+# Make it executable
+chmod +x kubectl
+
+# Move it to a directory in PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify installation
+kubectl version --client
+
+=================================================================================
+
+
+sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+https://packages.cloud.google.com/apt cloud-sdk main" | \
+sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+
+sudo apt-get update
+
+sudo apt-get install google-cloud-cli -y
+sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin -y
+
+gcloud command to interact with GKE --> gcloud uses google-cloud-sdk-gke-gcloud-auth-plugin
+
+========================================================================================
+========================================================================================
+========================================================================================
+
+pipeline {
+    agent any
+
+    environment {
+        PROJECT_ID      = 'demo9-403705'
+        GKE_CLUSTER     = 'hello-cluster'
+        GKE_ZONE        = 'us-central1-a'
+
+        GCP_CREDS       = 'gcp-service-account'   // Jenkins secret file
+        DOCKER_CREDS    = 'dockerhub'
+        GITHUB_CREDS    = 'github-creds'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git 'https://github.com/jsachdev07/tf-eks-ci-cd.git'
+            }
+        }
+
+        stage('Build Application') {
+            steps {
+                sh '''
+                    mvn clean package
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    cp target/ABCtechnologies-1.0.war abc_tech.war
+
+                    docker build \
+                    -t abc_tech:$BUILD_NUMBER .
+
+                    docker tag \
+                    abc_tech:$BUILD_NUMBER \
+                    jsachdev07/abc_tech:$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                withDockerRegistry(
+                    [credentialsId: "${DOCKER_CREDS}", url: ""]
+                ) {
+                    sh '''
+                        docker push jsachdev07/abc_tech:$BUILD_NUMBER
+                    '''
+                }
+            }
+        }
+
+        stage('Authenticate GCP + Connect GKE') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: "${GCP_CREDS}",
+                        variable: 'GCP_KEY'
+                    )
+                ]) {
+                    sh '''
+                        echo "Authenticating to GCP..."
+
+                        gcloud auth activate-service-account \
+                        --key-file=$GCP_KEY
+
+                        gcloud config set project ${PROJECT_ID}
+
+                        echo "Fetching GKE credentials..."
+
+                        gcloud container clusters get-credentials \
+                        ${GKE_CLUSTER} \
+                        --zone ${GKE_ZONE} \
+                        --project ${PROJECT_ID}
+
+                        kubectl get nodes
+                    '''
+                }
+            }
+        }
+
+
+        stage('Update Deployment Manifest in Git') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${GITHUB_CREDS}",
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        echo "Updating deployment manifest..."
+
+                        export BUILD_NUMBER=${BUILD_NUMBER}
+
+                        envsubst \
+                        < k8s/deployment-template.yaml \
+                        > k8s-argo/deployment.yaml
+
+                        git config --global user.email "jenkins@ci.local"
+                        git config --global user.name "Jenkins"
+
+                        git remote set-url origin \
+                        https://${GIT_USER}:${GIT_TOKEN}@github.com/jsachdev07/tf-eks-ci-cd.git
+
+                        git add k8s-argo/deployment.yaml
+
+                        git commit -m "Update image version ${BUILD_NUMBER}" \
+                        || echo "No changes to commit"
+
+                        git push origin master \
+                        || echo "No changes to push"
+                    '''
+                }
+            }
+        }
+
+        stage('Create ArgoCD Application (One Time Only)') {
+            steps {
+                sh '''
+                    if ! kubectl get application abc-tech -n argocd >/dev/null 2>&1; then
+                        echo "Creating ArgoCD Application..."
+
+cat <<EOF | kubectl apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: abc-tech
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/jsachdev07/tf-eks-ci-cd.git
+    targetRevision: master
+    path: k8s-argo
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+EOF
+
+                    else
+                        echo "ArgoCD Application already exists"
+                    fi
+
+                    kubectl get application abc-tech -n argocd
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline completed successfully."
+            echo "ArgoCD will auto-sync latest changes to GKE."
+        }
+
+        failure {
+            echo "Pipeline failed. Check Jenkins logs."
+        }
+    }
+}
+
+
+
+========================================================================================
+========================================================================================
+========================================================================================
+
+Alternative of last step (put application yaml file on github itself)--> 
+
+
+
+stage('Create ArgoCD Application (One Time Only)') {
+    steps {
+        sh '''
+            if ! kubectl get application abc-tech -n argocd >/dev/null 2>&1; then
+                echo "Creating ArgoCD Application from Git repo manifest..."
+
+                kubectl apply -f argocd/application.yaml
+
+            else
+                echo "ArgoCD Application already exists"
+            fi
+
+            kubectl get application abc-tech -n argocd
+        '''
+    }
+}
