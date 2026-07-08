@@ -30,7 +30,7 @@ variable "desired_capacity" {
 
 variable "max_size" {
   description = "Max nodes in the node group"
-  default     = 3
+  default     = 1
 }
 
 variable "min_size" {
