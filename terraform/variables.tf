@@ -20,7 +20,7 @@ variable "node_group_name" {
 
 variable "node_instance_type" {
   description = "EC2 instance type for nodes"
-  default     = "t3.medium"
+  default     = "c7i-flex.large"
 }
 
 variable "desired_capacity" {
